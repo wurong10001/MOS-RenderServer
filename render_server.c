@@ -1,10 +1,9 @@
-/* RenderServer 核心实现
+/* RenderServer 核心实现 (v2: 多租户身份/能力/事件队列/fb 句柄/配额)
  *
- * 纯 C、零 libc 依赖 (自带 arena 分配器与 memcpy/memset), 可直接编译为 wasm32,
- * 也可在宿主 (WASM3 / 原生测试) 中链接运行。
- *
- * 职责: framebuffer 池 / 窗口树 / 合成 / 脏区。
- * 像素格式 RGBA8 (字节序 R,G,B,A), 与 sample.wasm 约定一致。
+ * 纯 C、零 libc 依赖 (自带 arena 分配器与 memcpy/memset), 可直接编译为 wasm32。
+ * v1 ABI 全部保留; v2 见 render_server.h 注释。
+ * 已定义未启用: TRANSPARENT/MODAL/opacity 合成效果、min-max clamp、parent 联动、
+ * quota_fps —— 字段存取生效, 行为由后续版本或宿主实现。
  */
 #include "render_server.h"
 
@@ -100,18 +99,78 @@ static void dirty_union(int x, int y, int w, int h) {
     g_dh = y2 - g_dy;
 }
 
-/* ===================== 窗口树 ===================== */
+/* ===================== 实例注册表 ===================== */
+#define RS_MAX_INSTANCES 16
+
+struct rs_inst {
+    uint32_t id;        /* slot+1, 0 为 legacy 特权实例 */
+    int      used;
+    uint32_t uid;
+    uint32_t caps;
+    uint32_t manifest;
+    uint32_t quota_mem; /* 0 = 不限 */
+    uint32_t used_mem;
+    char     name[32];
+    uint32_t name_len;
+    uint8_t* cfg;
+    uint32_t cfg_len;
+};
+static struct rs_inst g_inst[RS_MAX_INSTANCES];
+
+static struct rs_inst* inst_by_id(uint32_t id) {
+    if (id == 0) return 0;
+    for (int i = 0; i < RS_MAX_INSTANCES; i++)
+        if (g_inst[i].used && g_inst[i].id == id) return &g_inst[i];
+    return 0;
+}
+
+/* 能力判定: legacy 实例 0 恒通过; 未知实例按最小权限拒绝 */
+static int inst_cap(uint32_t inst, uint32_t cap) {
+    if (inst == 0) return 1;
+    struct rs_inst* a = inst_by_id(inst);
+    return a && (a->caps & cap) ? 1 : 0;
+}
+
+/* 配额记账; 返回 1 成功(已记账), 0 拒绝 */
+static int inst_charge(uint32_t inst, uint32_t bytes) {
+    if (inst == 0) return 1;
+    struct rs_inst* a = inst_by_id(inst);
+    if (!a) return 0;
+    if (a->quota_mem > 0 && a->used_mem + bytes > a->quota_mem) return 0;
+    a->used_mem += bytes;
+    return 1;
+}
+static void inst_refund(uint32_t inst, uint32_t bytes) {
+    struct rs_inst* a = inst_by_id(inst);
+    if (a && a->used_mem >= bytes) a->used_mem -= bytes;
+}
+
+/* ===================== 窗口树 + 事件队列 ===================== */
 #define RS_MAX_WINDOWS 16
+#define RS_EVQ 8
+
+struct rs_evt { int32_t v[4]; };
 
 struct rs_window {
     uint32_t  id;
     int       used;
     int       x, y, w, h;
+    int       alloc_w, alloc_h;
     int       z;
     int       visible;
     int       focused;
+    uint32_t  inst;
+    uint32_t  flags;
+    int32_t   min_w, min_h, max_w, max_h; /* 存储, clamp 未启用 */
+    int32_t   parent;                     /* 存储, 联动未启用 */
+    uint32_t  icon;
+    uint32_t  opacity;    /* 0..255, 存储; 合成 alpha 路径未启用 */
+    uint32_t  close_pend;
     uint32_t* buf;
-    char      title[32];
+    char      title[128];
+    uint32_t  title_len;
+    struct rs_evt evq[RS_EVQ];
+    int ev_head, ev_count;
 };
 
 static struct rs_window g_wins[RS_MAX_WINDOWS];
@@ -124,62 +183,184 @@ static struct rs_window* win_by_id(uint32_t id) {
         if (g_wins[i].used && g_wins[i].id == id) return &g_wins[i];
     return 0;
 }
+static int win_slot(const struct rs_window* w) { return (int)(w - g_wins); }
 
-/* ===================== 单模块 (RS_MONOLITHIC) 下的 app 驱动 ===================== */
+static void q_push(struct rs_window* win, int32_t type, int32_t x, int32_t y,
+                   int32_t meta) {
+    if (!inst_cap(win->inst, RS_CAP_INPUT)) return;
+    if (win->ev_count >= RS_EVQ) return; /* 队满丢弃(背压由 app 帧循环保证) */
+    int tail = (win->ev_head + win->ev_count) % RS_EVQ;
+    win->evq[tail].v[0] = type;
+    win->evq[tail].v[1] = x;
+    win->evq[tail].v[2] = y;
+    win->evq[tail].v[3] = meta;
+    win->ev_count++;
+}
+
+/* ===================== 单模块 (RS_MONOLITHIC) app 驱动 ===================== */
 #ifdef RS_MONOLITHIC
 void rs_app_register_all(void);
 void rs_apps_init_all(void);
 void rs_apps_frame_all(int32_t frame);
-void rs_apps_event(int32_t type, int32_t x, int32_t y, int32_t meta);
 #endif
 
-/* ===================== 公共 C ABI 实现 ===================== */
-uint32_t rs_create_window(uint32_t title_ptr, uint32_t title_len, int32_t x,
-                          int32_t y, int32_t w, int32_t h) {
+/* ===================== 实例 API ===================== */
+uint32_t rs_register_app(uint32_t name_ptr, uint32_t name_len, uint32_t uid,
+                         uint32_t capabilities, uint32_t manifest_version) {
+    struct rs_inst* a = 0;
+    for (int i = 0; i < RS_MAX_INSTANCES; i++)
+        if (!g_inst[i].used) { a = &g_inst[i]; break; }
+    if (!a) return 0;
+    rs_memset(a, 0, sizeof(*a));
+    a->used = 1;
+    a->id = (uint32_t)(a - g_inst) + 1u;
+    a->uid = uid;
+    a->caps = capabilities;
+    a->manifest = manifest_version;
+    if (name_ptr && name_len) {
+        uint32_t n = name_len < 31 ? name_len : 31;
+        rs_memcpy(a->name, (const void*)(uintptr_t)name_ptr, n);
+        a->name[n] = 0;
+        a->name_len = n;
+    }
+    return a->id;
+}
+
+uint32_t rs_instance_uid(uint32_t inst) {
+    struct rs_inst* a = inst_by_id(inst);
+    return a ? a->uid : 0;
+}
+uint32_t rs_instance_caps(uint32_t inst) {
+    struct rs_inst* a = inst_by_id(inst);
+    return a ? a->caps : 0;
+}
+uint32_t rs_instance_manifest_version(uint32_t inst) {
+    struct rs_inst* a = inst_by_id(inst);
+    return a ? a->manifest : 0;
+}
+uint32_t rs_instance_name(uint32_t inst, uint32_t dst, uint32_t cap) {
+    struct rs_inst* a = inst_by_id(inst);
+    if (!a || !dst) return 0;
+    uint32_t n = a->name_len < cap ? a->name_len : cap;
+    rs_memcpy((void*)(uintptr_t)dst, a->name, n);
+    return a->name_len;
+}
+void rs_set_instance_quota_mem(uint32_t inst, uint32_t quota_bytes) {
+    struct rs_inst* a = inst_by_id(inst);
+    if (a) a->quota_mem = quota_bytes;
+}
+uint32_t rs_instance_used_mem(uint32_t inst) {
+    struct rs_inst* a = inst_by_id(inst);
+    return a ? a->used_mem : 0;
+}
+void rs_set_instance_config(uint32_t inst, uint32_t ptr, uint32_t len) {
+    struct rs_inst* a = inst_by_id(inst);
+    if (!a) return;
+    if (len > 4096) len = 4096;
+    uint8_t* copy = ptr ? (uint8_t*)rs_alloc(len) : 0;
+    if (len && !copy) return;
+    if (len) rs_memcpy(copy, (const void*)(uintptr_t)ptr, len);
+    a->cfg = copy;
+    a->cfg_len = len;
+}
+uint32_t rs_instance_config_len(uint32_t inst) {
+    struct rs_inst* a = inst_by_id(inst);
+    return a ? a->cfg_len : 0;
+}
+uint32_t rs_instance_get_config(uint32_t inst, uint32_t dst, uint32_t cap) {
+    struct rs_inst* a = inst_by_id(inst);
+    if (!a || !dst) return 0;
+    uint32_t n = a->cfg_len < cap ? a->cfg_len : cap;
+    if (n && a->cfg) rs_memcpy((void*)(uintptr_t)dst, a->cfg, n);
+    return a->cfg_len;
+}
+
+/* ===================== 窗口创建/销毁 ===================== */
+static uint32_t win_create(uint32_t inst, uint32_t title_ptr,
+                           uint32_t title_len, int32_t x, int32_t y, int32_t w,
+                           int32_t h, uint32_t flags, int32_t min_w,
+                           int32_t min_h, int32_t max_w, int32_t max_h,
+                           int32_t parent) {
     if (w <= 0 || h <= 0 || g_win_count >= RS_MAX_WINDOWS) return 0;
+    if (!inst_cap(inst, RS_CAP_RENDER)) return 0;
+    uint32_t bytes = (uint32_t)w * (uint32_t)h * 4u;
+    if (!inst_charge(inst, bytes)) return 0;
     struct rs_window* win = 0;
     for (int i = 0; i < RS_MAX_WINDOWS; i++)
         if (!g_wins[i].used) { win = &g_wins[i]; break; }
-    if (!win) return 0;
+    if (!win) { inst_refund(inst, bytes); return 0; }
     uint32_t* buf = (uint32_t*)rs_alloc((size_t)w * (size_t)h * 4u);
-    if (!buf) return 0;
+    if (!buf) { inst_refund(inst, bytes); return 0; }
     rs_memset(buf, 0, (size_t)w * (size_t)h * 4u);
+
     win->id = g_next_id++;
     win->used = 1;
     win->x = x; win->y = y; win->w = w; win->h = h;
+    win->alloc_w = w; win->alloc_h = h;
     win->z = g_win_count;
-    win->visible = 1;
+    win->inst = inst;
+    win->flags = flags;
+    win->visible = (flags & RS_FLAG_VISIBLE) ? 1 : 0;
     win->focused = 0;
+    win->min_w = min_w; win->min_h = min_h; win->max_w = max_w; win->max_h = max_h;
+    win->parent = parent;
+    win->icon = 0;
+    win->opacity = 255;
+    win->close_pend = 0;
     win->buf = buf;
+    win->ev_head = win->ev_count = 0;
     if (title_ptr && title_len) {
-        uint32_t n = title_len < 31 ? title_len : 31;
+        uint32_t n = title_len < 127 ? title_len : 127;
         rs_memcpy(win->title, (const void*)(uintptr_t)title_ptr, n);
         win->title[n] = 0;
+        win->title_len = n;
     } else {
         win->title[0] = 0;
+        win->title_len = 0;
     }
     g_win_count++;
     dirty_union(x, y, w, h);
     return win->id;
 }
 
+uint32_t rs_create_window(uint32_t title_ptr, uint32_t title_len, int32_t x,
+                          int32_t y, int32_t w, int32_t h) {
+    return win_create(0, title_ptr, title_len, x, y, w, h,
+                      RS_FLAG_VISIBLE | RS_FLAG_FOCUSABLE, 0, 0, 0, 0, 0);
+}
+
+uint32_t rs_create_window2(uint32_t inst, uint32_t title_ptr,
+                           uint32_t title_len, int32_t x, int32_t y, int32_t w,
+                           int32_t h, uint32_t flags, int32_t min_w,
+                           int32_t min_h, int32_t max_w, int32_t max_h,
+                           int32_t parent_window_id) {
+    if (inst != 0 && !inst_by_id(inst)) return 0;
+    return win_create(inst, title_ptr, title_len, x, y, w, h, flags, min_w,
+                      min_h, max_w, max_h, parent_window_id);
+}
+
 void rs_destroy_window(uint32_t id) {
     struct rs_window* win = win_by_id(id);
     if (!win) return;
     dirty_union(win->x, win->y, win->w, win->h);
+    inst_refund(win->inst, (uint32_t)win->alloc_w * (uint32_t)win->alloc_h * 4u);
     rs_free(win->buf);
     if (g_focused == win->id) g_focused = 0;
     rs_memset(win, 0, sizeof(*win));
     g_win_count--;
 }
 
+/* ===================== 窗口几何/状态 ===================== */
 void rs_window_set_rect(uint32_t id, int32_t x, int32_t y, int32_t w,
                         int32_t h) {
     struct rs_window* win = win_by_id(id);
     if (!win || w <= 0 || h <= 0) return;
+    if (!inst_cap(win->inst, RS_CAP_RENDER)) return;
     dirty_union(win->x, win->y, win->w, win->h);
+    int resized = (win->w != w || win->h != h);
     win->x = x; win->y = y; win->w = w; win->h = h;
     dirty_union(x, y, w, h);
+    if (resized) q_push(win, RS_EV_RESIZE, w, h, 0);
 }
 
 void rs_window_set_pos(uint32_t id, int32_t x, int32_t y) {
@@ -201,12 +382,16 @@ void rs_window_show(uint32_t id, int32_t visible) {
     struct rs_window* win = win_by_id(id);
     if (!win) return;
     win->visible = visible ? 1 : 0;
+    if (visible) win->flags |= RS_FLAG_VISIBLE;
+    else win->flags &= ~RS_FLAG_VISIBLE;
     dirty_union(win->x, win->y, win->w, win->h);
 }
 
 void rs_window_focus(uint32_t id) {
     struct rs_window* win = win_by_id(id);
     if (!win) return;
+    if (!(win->flags & RS_FLAG_FOCUSABLE)) return;
+    uint32_t prev_id = (g_focused == win->id) ? 0 : g_focused;
     for (int i = 0; i < RS_MAX_WINDOWS; i++) g_wins[i].focused = 0;
     win->focused = 1;
     g_focused = id;
@@ -215,12 +400,36 @@ void rs_window_focus(uint32_t id) {
         if (g_wins[i].used && g_wins[i].z > maxz) maxz = g_wins[i].z;
     win->z = maxz + 1;
     dirty_union(win->x, win->y, win->w, win->h);
+    struct rs_window* prev = prev_id ? win_by_id(prev_id) : 0;
+    if (prev) q_push(prev, RS_EV_BLUR, 0, 0, 0);
+    q_push(win, RS_EV_FOCUS, 0, 0, 0);
 }
 
 uint32_t rs_window_get_buffer(uint32_t id) {
     struct rs_window* win = win_by_id(id);
     if (!win) return 0;
     return (uint32_t)(uintptr_t)win->buf;
+}
+
+/* fb 句柄: slot+1, 与窗口对象分离 */
+uint32_t rs_window_get_fb(uint32_t id) {
+    struct rs_window* win = win_by_id(id);
+    return win ? (uint32_t)(win_slot(win) + 1) : 0;
+}
+uint32_t rs_fb_addr(uint32_t fb) {
+    if (fb == 0 || fb > RS_MAX_WINDOWS) return 0;
+    struct rs_window* w = &g_wins[fb - 1];
+    return w->used ? (uint32_t)(uintptr_t)w->buf : 0;
+}
+uint32_t rs_fb_w(uint32_t fb) {
+    if (fb == 0 || fb > RS_MAX_WINDOWS) return 0;
+    struct rs_window* w = &g_wins[fb - 1];
+    return w->used ? (uint32_t)w->alloc_w : 0;
+}
+uint32_t rs_fb_h(uint32_t fb) {
+    if (fb == 0 || fb > RS_MAX_WINDOWS) return 0;
+    struct rs_window* w = &g_wins[fb - 1];
+    return w->used ? (uint32_t)w->alloc_h : 0;
 }
 
 int32_t rs_window_width(uint32_t id) {
@@ -239,11 +448,62 @@ int32_t rs_window_y(uint32_t id) {
     struct rs_window* win = win_by_id(id);
     return win ? win->y : 0;
 }
+uint32_t rs_window_get_flags(uint32_t id) {
+    struct rs_window* win = win_by_id(id);
+    return win ? win->flags : 0;
+}
+int32_t rs_window_parent(uint32_t id) {
+    struct rs_window* win = win_by_id(id);
+    return win ? win->parent : 0;
+}
+uint32_t rs_window_instance(uint32_t id) {
+    struct rs_window* win = win_by_id(id);
+    return win ? win->inst : 0;
+}
 
+void rs_set_window_title(uint32_t id, uint32_t ptr, uint32_t len) {
+    struct rs_window* win = win_by_id(id);
+    if (!win) return;
+    if (len > 127) len = 127;
+    if (ptr && len) {
+        rs_memcpy(win->title, (const void*)(uintptr_t)ptr, len);
+        win->title[len] = 0;
+        win->title_len = len;
+    } else {
+        win->title[0] = 0;
+        win->title_len = 0;
+    }
+}
+uint32_t rs_window_get_title(uint32_t id, uint32_t dst, uint32_t cap) {
+    struct rs_window* win = win_by_id(id);
+    if (!win || !dst) return 0;
+    uint32_t n = win->title_len < cap ? win->title_len : cap;
+    rs_memcpy((void*)(uintptr_t)dst, win->title, n);
+    return win->title_len;
+}
+void rs_set_window_icon(uint32_t id, uint32_t icon_res_id) {
+    struct rs_window* win = win_by_id(id);
+    if (win) win->icon = icon_res_id;
+}
+uint32_t rs_window_get_icon(uint32_t id) {
+    struct rs_window* win = win_by_id(id);
+    return win ? win->icon : 0;
+}
+void rs_window_set_opacity(uint32_t id, uint32_t opacity0_255) {
+    struct rs_window* win = win_by_id(id);
+    if (win) win->opacity = opacity0_255 > 255 ? 255 : opacity0_255;
+}
+uint32_t rs_window_get_opacity(uint32_t id) {
+    struct rs_window* win = win_by_id(id);
+    return win ? win->opacity : 0;
+}
+
+/* ===================== 绘制 (需 RENDER) ===================== */
 void rs_window_mark_dirty(uint32_t id, int32_t x, int32_t y, int32_t w,
                           int32_t h) {
     struct rs_window* win = win_by_id(id);
     if (!win) return;
+    if (!inst_cap(win->inst, RS_CAP_RENDER)) return;
     int sx = win->x + x, sy = win->y + y;
     if (sx < 0) { w += sx; sx = 0; }
     if (sy < 0) { h += sy; sy = 0; }
@@ -253,13 +513,15 @@ void rs_window_mark_dirty(uint32_t id, int32_t x, int32_t y, int32_t w,
 void rs_window_mark_dirty_full(uint32_t id) {
     struct rs_window* win = win_by_id(id);
     if (!win) return;
+    if (!inst_cap(win->inst, RS_CAP_RENDER)) return;
     dirty_union(win->x, win->y, win->w, win->h);
 }
 
 void rs_fill_rect(uint32_t id, int32_t x, int32_t y, int32_t w, int32_t h,
-                 uint32_t color) {
+                  uint32_t color) {
     struct rs_window* win = win_by_id(id);
     if (!win) return;
+    if (!inst_cap(win->inst, RS_CAP_RENDER)) return;
     for (int yy = y; yy < y + h; yy++) {
         if (yy < 0 || yy >= win->h) continue;
         for (int xx = x; xx < x + w; xx++) {
@@ -272,11 +534,12 @@ void rs_fill_rect(uint32_t id, int32_t x, int32_t y, int32_t w, int32_t h,
 void rs_put_pixel(uint32_t id, int32_t x, int32_t y, uint32_t color) {
     struct rs_window* win = win_by_id(id);
     if (!win) return;
+    if (!inst_cap(win->inst, RS_CAP_RENDER)) return;
     if (x < 0 || x >= win->w || y < 0 || y >= win->h) return;
     win->buf[(size_t)y * win->w + x] = color;
 }
 
-/* ===================== 合成 ===================== */
+/* ===================== 合成 (逻辑与 v1 一致) ===================== */
 static void composite_region(int dx, int dy, int dw, int dh) {
     int done[RS_MAX_WINDOWS] = {0};
     for (int yy = dy; yy < dy + dh; yy++) {
@@ -290,7 +553,7 @@ static void composite_region(int dx, int dy, int dw, int dh) {
         int best = -1, bestz = 0x7fffffff;
         for (int i = 0; i < RS_MAX_WINDOWS; i++) {
             if (!g_wins[i].used || !g_wins[i].visible) continue;
-        if (done[i]) continue;
+            if (done[i]) continue;
             if (g_wins[i].z < bestz) { bestz = g_wins[i].z; best = i; }
         }
         if (best < 0) break;
@@ -338,6 +601,7 @@ uint32_t rs_init(void) {
     g_focused = 0;
     g_win_count = 0;
     rs_memset(g_wins, 0, sizeof(g_wins));
+    rs_memset(g_inst, 0, sizeof(g_inst));
     g_screen = (uint32_t*)rs_alloc((size_t)RS_SCREEN_W * RS_SCREEN_H * 4u);
     if (!g_screen) return 0;
     rs_memset(g_screen, 0, (size_t)RS_SCREEN_W * RS_SCREEN_H * 4u);
@@ -350,7 +614,7 @@ uint32_t rs_init(void) {
 }
 
 void rs_frame(int32_t frame) {
-    (void)frame; /* used only in monolithic build */
+    (void)frame;
 #ifdef RS_MONOLITHIC
     rs_apps_frame_all(frame);
 #endif
@@ -362,6 +626,7 @@ int32_t rs_hit_test(int32_t x, int32_t y) {
     for (int i = 0; i < RS_MAX_WINDOWS; i++) {
         struct rs_window* w = &g_wins[i];
         if (!w->used || !w->visible) continue;
+        if (w->parent != 0) continue; /* 联动未启用, 暂不阻断命中 */
         if (x >= w->x && x < w->x + w->w && y >= w->y && y < w->y + w->h) {
             if (w->z > bestz) { bestz = w->z; best = i; }
         }
@@ -370,12 +635,38 @@ int32_t rs_hit_test(int32_t x, int32_t y) {
 }
 
 void rs_dispatch_event(int32_t type, int32_t x, int32_t y, int32_t meta) {
-#ifdef RS_MONOLITHIC
-    (void)meta; (void)type; (void)x; (void)y;
-    rs_apps_event(type, x, y, meta);
-#else
-    (void)type; (void)x; (void)y; (void)meta;
-#endif
+    int32_t wid = rs_hit_test(x, y);
+    if (!wid) return;
+    struct rs_window* win = win_by_id((uint32_t)wid);
+    if (!win) return;
+    q_push(win, type, x, y, meta);
+}
+
+int32_t rs_window_poll_event(uint32_t id, uint32_t out_ptr) {
+    struct rs_window* win = win_by_id(id);
+    if (!win || win->ev_count <= 0 || !out_ptr) return 0;
+    int32_t* out = (int32_t*)(uintptr_t)out_ptr;
+    out[0] = win->evq[win->ev_head].v[0];
+    out[1] = win->evq[win->ev_head].v[1];
+    out[2] = win->evq[win->ev_head].v[2];
+    out[3] = win->evq[win->ev_head].v[3];
+    win->ev_head = (win->ev_head + 1) % RS_EVQ;
+    win->ev_count--;
+    return 1;
+}
+
+void rs_window_close_request(uint32_t id) {
+    struct rs_window* win = win_by_id(id);
+    if (!win) return;
+    win->close_pend = 1;
+    q_push(win, RS_EV_CLOSE_REQ, 0, 0, 0);
+}
+uint32_t rs_window_close_pending(uint32_t id) {
+    struct rs_window* win = win_by_id(id);
+    return win ? win->close_pend : 0;
+}
+void rs_window_close_ack(uint32_t id) {
+    rs_destroy_window(id);
 }
 
 uint32_t rs_get_screen_buffer(void) {

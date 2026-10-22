@@ -121,6 +121,13 @@ async function main() {
   canvas.height = screenH;
   server.exports.rs_init();
 
+  // app 静态数据放在 APP_GLOBAL_BASE (6.5MB+), 先把共享内存扩到位
+  {
+    const mem = server.exports.memory;
+    const have = mem.buffer.byteLength;
+    if (have < APP_MEM_TARGET) mem.grow(Math.ceil((APP_MEM_TARGET - have) / 65536));
+  }
+
   const appInstances = [];
   for (const a of APPS) {
     const imports = {

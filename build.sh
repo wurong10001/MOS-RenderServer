@@ -2,22 +2,26 @@
 # 编译 RenderServer 与示例 apps 为 wasm32 模块。
 # 产物 (out/):
 #   render_server.wasm      —— 仅 RenderServer 本体 (导出 memory + rs_*)
-#   app_a/b/c.wasm          —— 独立 app (从 "render_server" 导入 rs_*, 共享 server 内存)
-#   render_server_demo.wasm —— 单模块整合版 (server+apps), 供 WASM3 在设备上验证
-# 用法: bash render_server/build.sh
+#   app_a/b/c.wasm          —— 独立 app (从 "render_server" 导入 rs_*, 共享 server 内存,
+#                              静态数据经 --global-base 放到 6.5MB 以上, 避免与 server
+#                              数据段/6MB arena 冲突; 宿主需先把内存 grow 到 >=8MB)
+#   render_server_demo.wasm —— 单模块整合版 (server+apps), 供 WASM3 / Node 验证
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 OUT="$ROOT/out"
 mkdir -p "$OUT"
 CC=clang
-CFLAGS="--target=wasm32 -nostdlib -O2 -I$ROOT -Wall -Wextra"
+# -fno-builtin-*: 防止 clang 把字节循环优化成 env.memset/memcpy 导入
+# (-nostdlib 下这些导入在 JS/wasm3 宿主里会直接实例化失败)
+CFLAGS="--target=wasm32 -nostdlib -ffreestanding -fno-builtin-memset -fno-builtin-memcpy -O2 -I$ROOT -Wall -Wextra"
 LD_FLAGS="-Wl,--no-entry -Wl,--export-all -Wl,--allow-undefined"
+APP_LD="$LD_FLAGS -Wl,--import-memory -Wl,--global-base=6815744"
 echo "==> render_server.wasm (server only, exports memory)"
 clang $CFLAGS -DRS_COMPILE_SERVER $LD_FLAGS -Wl,--export-memory \
     -o "$OUT/render_server.wasm" "$ROOT/render_server.c"
 for a in a b c; do
     echo "==> app_$a.wasm (imports rs_* from render_server, shares memory)"
-    clang $CFLAGS $LD_FLAGS -Wl,--import-memory \
+    clang $CFLAGS $APP_LD \
         -o "$OUT/app_$a.wasm" "$ROOT/apps/app_$a.c"
 done
 echo "==> render_server_demo.wasm (monolithic: server + apps)"

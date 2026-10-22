@@ -1,27 +1,23 @@
 #!/usr/bin/env bash
+# RenderServer 验证入口:
+#   1) build.sh 编出 wasm32 产物
+#   2) Node WebAssembly 运行 test_render_server.mjs 做像素/ABI 断言
+#      (BASE: v1 合成行为; V2: 实例/能力/事件队列/fb/配额/元数据)
+# 旧版脚本依赖仓库中不存在的 wasm3 C harness, 已替换。
+# 设备内嵌验证(mos-android wasm3)可在集成时基于同一 out/render_server_demo.wasm 复用。
 set -euo pipefail
-# 在设备上用 WASM3 验证 RenderServer 单模块整合版 (无需浏览器)。
-# 用法: bash render_server/run_test.sh
+cd "$(dirname "$0")"
 
-ROOT=app/src/main/cpp/third_party/wasm3
+if ! command -v clang >/dev/null || ! command -v wasm-ld >/dev/null; then
+    echo "需要 clang + wasm-ld (LLVM, 建议 >=14): apt install clang lld" >&2
+    exit 127
+fi
 
-bash render_server/build.sh
+bash build.sh
 
-mkdir -p render_server/obj
-clang -std=gnu99 -O2 -Iapp/src/main/cpp/third_party/wasm3 -c app/src/main/cpp/third_party/wasm3/m3_api_libc.c -o render_server/obj/m3_api_libc.o
-clang -std=gnu99 -O2 -Iapp/src/main/cpp/third_party/wasm3 -c app/src/main/cpp/third_party/wasm3/m3_bind.c -o render_server/obj/m3_bind.o
-clang -std=gnu99 -O2 -Iapp/src/main/cpp/third_party/wasm3 -c app/src/main/cpp/third_party/wasm3/m3_code.c -o render_server/obj/m3_code.o
-clang -std=gnu99 -O2 -Iapp/src/main/cpp/third_party/wasm3 -c app/src/main/cpp/third_party/wasm3/m3_compile.c -o render_server/obj/m3_compile.o
-clang -std=gnu99 -O2 -Iapp/src/main/cpp/third_party/wasm3 -c app/src/main/cpp/third_party/wasm3/m3_core.c -o render_server/obj/m3_core.o
-clang -std=gnu99 -O2 -Iapp/src/main/cpp/third_party/wasm3 -c app/src/main/cpp/third_party/wasm3/m3_deterministic.c -o render_server/obj/m3_deterministic.o
-clang -std=gnu99 -O2 -Iapp/src/main/cpp/third_party/wasm3 -c app/src/main/cpp/third_party/wasm3/m3_env.c -o render_server/obj/m3_env.o
-clang -std=gnu99 -O2 -Iapp/src/main/cpp/third_party/wasm3 -c app/src/main/cpp/third_party/wasm3/m3_exec.c -o render_server/obj/m3_exec.o
-clang -std=gnu99 -O2 -Iapp/src/main/cpp/third_party/wasm3 -c app/src/main/cpp/third_party/wasm3/m3_function.c -o render_server/obj/m3_function.o
-clang -std=gnu99 -O2 -Iapp/src/main/cpp/third_party/wasm3 -c app/src/main/cpp/third_party/wasm3/m3_info.c -o render_server/obj/m3_info.o
-clang -std=gnu99 -O2 -Iapp/src/main/cpp/third_party/wasm3 -c app/src/main/cpp/third_party/wasm3/m3_module.c -o render_server/obj/m3_module.o
-clang -std=gnu99 -O2 -Iapp/src/main/cpp/third_party/wasm3 -c app/src/main/cpp/third_party/wasm3/m3_parse.c -o render_server/obj/m3_parse.o
-clang -std=gnu99 -O2 -Iapp/src/main/cpp/third_party/wasm3 -c app/src/main/cpp/third_party/wasm3/m3_snapshot.c -o render_server/obj/m3_snapshot.o
-clang -std=gnu99 -O2 -Iapp/src/main/cpp/third_party/wasm3 -c app/src/main/cpp/third_party/wasm3/m3_validate.c -o render_server/obj/m3_validate.o
-clang -std=gnu99 -O2 -Iapp/src/main/cpp/third_party/wasm3 -c app/src/main/cpp/third_party/wasm3/m3_xxh64.c -o render_server/obj/m3_xxh64.o
-clang++ -std=gnu++17 -O2 -Iapp/src/main/cpp/third_party/wasm3 tools/test_render_server_wasm.c render_server/obj/*.o -o tools/test_render_server_wasm
-./tools/test_render_server_wasm render_server/out/render_server_demo.wasm
+if command -v node >/dev/null; then
+    node test_render_server.mjs out
+else
+    echo "需要 node >=16 运行验证器 test_render_server.mjs" >&2
+    exit 127
+fi
