@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang='en'>
+<head>
+  <meta charset='utf-8' />
+  <meta name='viewport' content='width=device-width, initial-scale=1' />
+  <title>RenderServer (WASM) on WebGPU</title>
+  <style>
+    body { background: #111; color: #ccc; font-family: ui-monospace, monospace; margin: 24px; }
+    canvas { border: 1px solid #444; image-rendering: pixelated; background: #000; }
+    #status { margin-top: 8px; color: #8f8; }
+  </style>
+</head>
+<body>
+  <h3>RenderServer — multi-tenant WASM compositor on WebGPU</h3>
+  <canvas id='screen' width='480' height='320'></canvas>
+  <p>
+    Three independent WASM apps each draw only into their own window buffer.
+    The RenderServer owns the framebuffer pool, the window tree, dirty-region
+    tracking and compositing. The host forwards pointer events and commits the
+    composited frame to WebGPU.
+  </p>
+  <div id='status'>starting</div>
+  <script type='module' src='./webgpu_host.mjs'></script>
+</body>
+</html>

@@ -1,0 +1,3 @@
+out/
+obj/
+tools/test_render_server_wasm
