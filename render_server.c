@@ -257,9 +257,11 @@ void rs_set_instance_config(uint32_t inst, uint32_t ptr, uint32_t len) {
     struct rs_inst* a = inst_by_id(inst);
     if (!a) return;
     if (len > 4096) len = 4096;
-    uint8_t* copy = ptr ? (uint8_t*)rs_alloc(len) : 0;
+    if (len && !ptr) return;
+    uint8_t* copy = len ? (uint8_t*)rs_alloc(len) : 0;
     if (len && !copy) return;
     if (len) rs_memcpy(copy, (const void*)(uintptr_t)ptr, len);
+    rs_free(a->cfg);
     a->cfg = copy;
     a->cfg_len = len;
 }
@@ -282,6 +284,7 @@ static uint32_t win_create(uint32_t inst, uint32_t title_ptr,
                            int32_t min_h, int32_t max_w, int32_t max_h,
                            int32_t parent) {
     if (w <= 0 || h <= 0 || g_win_count >= RS_MAX_WINDOWS) return 0;
+    if ((size_t)w > RS_HEAP_SIZE / 4u / (size_t)h) return 0;
     if (!inst_cap(inst, RS_CAP_RENDER)) return 0;
     uint32_t bytes = (uint32_t)w * (uint32_t)h * 4u;
     if (!inst_charge(inst, bytes)) return 0;
@@ -356,8 +359,37 @@ void rs_window_set_rect(uint32_t id, int32_t x, int32_t y, int32_t w,
     struct rs_window* win = win_by_id(id);
     if (!win || w <= 0 || h <= 0) return;
     if (!inst_cap(win->inst, RS_CAP_RENDER)) return;
-    dirty_union(win->x, win->y, win->w, win->h);
     int resized = (win->w != w || win->h != h);
+    if (resized && (win->alloc_w != w || win->alloc_h != h)) {
+        if ((size_t)w > RS_HEAP_SIZE / 4u / (size_t)h) return;
+        uint32_t new_bytes = (uint32_t)((size_t)w * (size_t)h * 4u);
+        uint32_t old_bytes =
+            (uint32_t)((size_t)win->alloc_w * (size_t)win->alloc_h * 4u);
+        uint32_t extra_bytes = new_bytes > old_bytes ? new_bytes - old_bytes : 0;
+        if (!inst_charge(win->inst, extra_bytes)) return;
+
+        uint32_t* new_buf = (uint32_t*)rs_alloc(new_bytes);
+        if (!new_buf) {
+            inst_refund(win->inst, extra_bytes);
+            return;
+        }
+        rs_memset(new_buf, 0, new_bytes);
+        int copy_w = win->alloc_w < w ? win->alloc_w : w;
+        int copy_h = win->alloc_h < h ? win->alloc_h : h;
+        for (int row = 0; row < copy_h; row++) {
+            rs_memcpy(&new_buf[(size_t)row * (size_t)w],
+                      &win->buf[(size_t)row * (size_t)win->alloc_w],
+                      (size_t)copy_w * 4u);
+        }
+
+        rs_free(win->buf);
+        win->buf = new_buf;
+        win->alloc_w = w;
+        win->alloc_h = h;
+        if (old_bytes > new_bytes)
+            inst_refund(win->inst, old_bytes - new_bytes);
+    }
+    dirty_union(win->x, win->y, win->w, win->h);
     win->x = x; win->y = y; win->w = w; win->h = h;
     dirty_union(x, y, w, h);
     if (resized) q_push(win, RS_EV_RESIZE, w, h, 0);

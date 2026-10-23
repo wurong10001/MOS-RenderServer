@@ -8,6 +8,8 @@
 //   - host_submit (server 合成后回调) -> 把脏矩形写入 WebGPU 纹理并呈现
 //   - 事件转发: 指针事件 -> hit-test -> 路由给顶层窗口所属的 app
 
+import { packDirtyRect } from './webgpu_upload.mjs';
+
 const SERVER_URL = './out/render_server.wasm';
 const APPS = [
   { name: 'app_a', url: './out/app_a.wasm', init: 'app_a_init', frame: 'app_a_frame', event: 'app_a_event' },
@@ -84,8 +86,7 @@ async function main() {
   let server = null;
   function hostSubmit(offset, w, h, dx, dy, dw, dh) {
     ensurePipeline(w, h);
-    const mem = server.exports.memory;
-    const src = new Uint8Array(mem.buffer, offset, dw * dh * 4);
+    const src = packDirtyRect(server.exports.memory, offset, w, h, dx, dy, dw, dh);
     device.queue.writeTexture(
       { texture },
       src,
@@ -121,11 +122,31 @@ async function main() {
   canvas.height = screenH;
   server.exports.rs_init();
 
-  // app 静态数据放在 APP_GLOBAL_BASE (6.5MB+), 先把共享内存扩到位
+  const memoryConfigResponse = await fetch('./memory_config.json');
+  if (!memoryConfigResponse.ok)
+    throw new Error(`Failed to load memory_config.json: HTTP ${memoryConfigResponse.status}`);
+  const memoryConfig = await memoryConfigResponse.json();
+  const { appGlobalBase, appMemoryTarget } = memoryConfig;
+  if (!Number.isSafeInteger(appGlobalBase) || !Number.isSafeInteger(appMemoryTarget) ||
+      appGlobalBase <= 0 || appMemoryTarget <= appGlobalBase) {
+    throw new Error('Invalid memory_config.json values');
+  }
+
+  // App 静态数据基址和共享内存目标统一配置在 memory_config.json。
   {
     const mem = server.exports.memory;
     const have = mem.buffer.byteLength;
-    if (have < APP_MEM_TARGET) mem.grow(Math.ceil((APP_MEM_TARGET - have) / 65536));
+    if (have < appMemoryTarget) {
+      const pages = Math.ceil((appMemoryTarget - have) / 65536);
+      try {
+        mem.grow(pages);
+      } catch (error) {
+        throw new Error(`Failed to grow shared WebAssembly memory to ${appMemoryTarget} bytes`, { cause: error });
+      }
+      // Memory growth detaches old ArrayBuffers; upload/log helpers read mem.buffer anew.
+      if (mem.buffer.byteLength < appMemoryTarget)
+        throw new Error('Shared WebAssembly memory did not reach the configured target');
+    }
   }
 
   const appInstances = [];

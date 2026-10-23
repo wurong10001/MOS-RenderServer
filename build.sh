@@ -11,11 +11,26 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 OUT="$ROOT/out"
 mkdir -p "$OUT"
 CC=clang
+if ! command -v node >/dev/null; then
+    echo "需要 node 读取 memory_config.json" >&2
+    exit 127
+fi
+read_memory_config() {
+    node -e 'const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); process.stdout.write(String(c[process.argv[2]]))' \
+        "$ROOT/memory_config.json" "$1"
+}
+APP_GLOBAL_BASE="$(read_memory_config appGlobalBase)"
+APP_MEMORY_TARGET="$(read_memory_config appMemoryTarget)"
+if [[ ! "$APP_GLOBAL_BASE" =~ ^[0-9]+$ || ! "$APP_MEMORY_TARGET" =~ ^[0-9]+$ ]] ||
+   (( APP_GLOBAL_BASE <= 0 || APP_MEMORY_TARGET <= APP_GLOBAL_BASE )); then
+    echo "memory_config.json 中的共享内存配置无效" >&2
+    exit 1
+fi
 # -fno-builtin-*: 防止 clang 把字节循环优化成 env.memset/memcpy 导入
 # (-nostdlib 下这些导入在 JS/wasm3 宿主里会直接实例化失败)
 CFLAGS="--target=wasm32 -nostdlib -ffreestanding -fno-builtin-memset -fno-builtin-memcpy -O2 -I$ROOT -Wall -Wextra"
 LD_FLAGS="-Wl,--no-entry -Wl,--export-all -Wl,--allow-undefined"
-APP_LD="$LD_FLAGS -Wl,--import-memory -Wl,--global-base=6815744"
+APP_LD="$LD_FLAGS -Wl,--import-memory -Wl,--global-base=$APP_GLOBAL_BASE"
 echo "==> render_server.wasm (server only, exports memory)"
 clang $CFLAGS -DRS_COMPILE_SERVER $LD_FLAGS -Wl,--export-memory \
     -o "$OUT/render_server.wasm" "$ROOT/render_server.c"

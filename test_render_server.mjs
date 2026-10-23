@@ -8,8 +8,10 @@
 //            focus-blur / fb 句柄 / 配额 / 关闭拦截 / icon / 标题 / 配置
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { packDirtyRect } from "./webgpu_upload.mjs";
 
 const OUT = process.argv[2] || join(process.cwd(), "out");
+const memoryConfig = JSON.parse(readFileSync(new URL("./memory_config.json", import.meta.url), "utf8"));
 const A_BASE = [40, 10, 10, 255];
 const B_BASE = [10, 40, 10, 255];
 const C_BASE = [10, 10, 40, 255];
@@ -54,6 +56,30 @@ function pixel(ex, addr, x, y, sw) {
   const b = bytes(ex);
   return [b[p], b[p + 1], b[p + 2], b[p + 3]];
 }
+
+curSuite = "UPLOAD";
+t("脏区上传: 按屏幕行跨度提取紧密矩形", () => {
+  const memory = { buffer: new ArrayBuffer(480 * 320 * 4) };
+  const screen = new Uint8Array(memory.buffer);
+  for (let y = 0; y < 10; y++) {
+    for (let x = 0; x < 480; x++) {
+      const i = (y * 480 + x) * 4;
+      screen.set([x & 255, y, 17, 255], i);
+    }
+  }
+  const packed = packDirtyRect(memory, 0, 480, 10, 7, 2, 3, 4);
+  eq(Array.from(packed.slice(0, 12)), [7, 2, 17, 255, 8, 2, 17, 255, 9, 2, 17, 255],
+    "脏矩形首行应从屏幕正确坐标提取");
+  eq(Array.from(packed.slice(12, 24)), [7, 3, 17, 255, 8, 3, 17, 255, 9, 3, 17, 255],
+    "脏矩形后续行应遵循完整屏幕行跨度");
+  let rejected = false;
+  try {
+    packDirtyRect(memory, 0, 480, 10, 479, 0, 2, 1);
+  } catch (error) {
+    rejected = error instanceof RangeError;
+  }
+  assert(rejected, "越界脏矩形应拒绝上传");
+});
 
 // ---------- BASE: v1 行为 ----------
 const submits = [];
@@ -109,9 +135,10 @@ async function runBase() {
     const srv = await WebAssembly.instantiate(readWasm("render_server.wasm"), hostObj([]));
     const sx = srv.instance.exports;
     sx.rs_init();
-    // app 静态数据基址 6.5MB (build.sh --global-base), 先扩内存
+    // app 静态数据基址与目标内存来自共享配置。
     const have = sx.memory.buffer.byteLength;
-    if (have < 8 * 1024 * 1024) sx.memory.grow(Math.ceil((8 * 1024 * 1024 - have) / 65536));
+    if (have < memoryConfig.appMemoryTarget)
+      sx.memory.grow(Math.ceil((memoryConfig.appMemoryTarget - have) / 65536));
     const app = await WebAssembly.instantiate(readWasm("app_a.wasm"), {
       env: { memory: sx.memory, host_log: () => {}, host_get_time: () => 0 },
       render_server: sx,
@@ -235,12 +262,49 @@ async function runV2() {
     eq(need(ex, "rs_fb_addr")(fb), need(ex, "rs_window_get_buffer")(win), "地址一致");
     eq([need(ex, "rs_fb_w")(fb), need(ex, "rs_fb_h")(fb)], [30, 20], "fb 尺寸");
   });
+  t("调整大小: 重分配帧缓冲并保留重叠像素", () => {
+    const fb = need(ex, "rs_window_get_fb")(win);
+    const oldAddr = need(ex, "rs_fb_addr")(fb);
+    const b = bytes(ex);
+    b.set([1, 2, 3, 4], oldAddr);
+    b.set([5, 6, 7, 8], oldAddr + ((19 * 30 + 29) * 4));
+    need(ex, "rs_window_set_rect")(win, 12, 222, 32, 22);
+    const newAddr = need(ex, "rs_fb_addr")(fb);
+    eq([need(ex, "rs_fb_w")(fb), need(ex, "rs_fb_h")(fb)], [32, 22], "新帧缓冲尺寸");
+    eq(Array.from(bytes(ex).slice(newAddr, newAddr + 4)), [1, 2, 3, 4], "保留左上角像素");
+    const last = newAddr + ((19 * 32 + 29) * 4);
+    eq(Array.from(bytes(ex).slice(last, last + 4)), [5, 6, 7, 8], "保留重叠区域像素");
+    const added = newAddr + ((21 * 32 + 31) * 4);
+    eq(Array.from(bytes(ex).slice(added, added + 4)), [0, 0, 0, 0], "新增区域清零");
+  });
+  t("调整大小: 配额不足时保持原帧缓冲", () => {
+    const n = str("resize-quota");
+    const i2 = ex.rs_register_app(n.ptr, n.len, 1006, 0xffffffff, 1);
+    const tt = str("small");
+    const w = need(ex, "rs_create_window2")(i2, tt.ptr, tt.len, 0, 0, 2, 2, 1, 0, 0, 0, 0, 0);
+    assert(w > 0, "小窗口创建失败");
+    need(ex, "rs_set_instance_quota_mem")(i2, 16);
+    need(ex, "rs_window_set_rect")(w, 4, 4, 4, 4);
+    const fb = need(ex, "rs_window_get_fb")(w);
+    eq([need(ex, "rs_fb_w")(fb), need(ex, "rs_fb_h")(fb)], [2, 2], "配额不足应维持旧尺寸");
+    eq([
+      need(ex, "rs_window_x")(w), need(ex, "rs_window_y")(w),
+      need(ex, "rs_window_width")(w), need(ex, "rs_window_height")(w),
+    ], [0, 0, 2, 2], "失败时几何尺寸和位置应保持不变");
+    eq(need(ex, "rs_instance_used_mem")(i2), 16, "失败时配额记账应不变");
+    need(ex, "rs_window_set_rect")(w, 4, 4, 1, 1);
+    eq(need(ex, "rs_instance_used_mem")(i2), 4, "缩小时应退还帧缓冲配额");
+    need(ex, "rs_window_set_rect")(w, 4, 4, 2, 2);
+    eq([need(ex, "rs_fb_w")(fb), need(ex, "rs_fb_h")(fb)], [2, 2], "释放配额后应允许扩容");
+    eq(need(ex, "rs_instance_used_mem")(i2), 16, "扩容后配额应准确记账");
+  });
   t("配额: 内存配额不足拒绝建窗", () => {
     const n = str("poor");
     const i2 = ex.rs_register_app(n.ptr, n.len, 1005, 0xffffffff, 1);
     need(ex, "rs_set_instance_quota_mem")(i2, 1000);
     const tt = str("big");
     eq(need(ex, "rs_create_window2")(i2, tt.ptr, tt.len, 5, 5, 300, 200, 1, 0, 0, 0, 0, 0), 0, "超配额应拒绝");
+    eq(need(ex, "rs_create_window2")(i2, tt.ptr, tt.len, 5, 5, 0x7fffffff, 0x7fffffff, 1, 0, 0, 0, 0, 0), 0, "溢出尺寸应拒绝");
   });
   t("关闭拦截: request 挂起 / ack 销毁", () => {
     need(ex, "rs_window_close_request")(win);
@@ -273,9 +337,14 @@ async function runV2() {
     const cfg = str('{"k":1}');
     need(ex, "rs_set_instance_config")(inst, cfg.ptr, cfg.len);
     eq(need(ex, "rs_instance_config_len")(inst), 7, "配置长度");
+    const replacement = str('{"k":2}');
+    need(ex, "rs_set_instance_config")(inst, replacement.ptr, replacement.len);
+    eq(need(ex, "rs_instance_config_len")(inst), 7, "替换配置长度");
     const dst = str("").ptr;
     eq(need(ex, "rs_instance_get_config")(inst, dst, 64), 7, "读取长度");
-    eq(String.fromCharCode(...bytes(ex).slice(dst, dst + 7)), '{"k":1}', "配置内容");
+    eq(String.fromCharCode(...bytes(ex).slice(dst, dst + 7)), '{"k":2}', "替换后配置内容");
+    need(ex, "rs_set_instance_config")(inst, 0, 0);
+    eq(need(ex, "rs_instance_config_len")(inst), 0, "零长度应清除配置");
   });
   t("未启用能力标记: opacity/parent 查询返回 NOT_SUPPORTED 语义", () => {
     // 字段可存: 建窗带 parent; 透明合成未启用: get_flags 回读
