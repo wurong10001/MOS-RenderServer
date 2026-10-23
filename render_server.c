@@ -178,6 +178,12 @@ static uint32_t g_next_id = 1;
 static uint32_t g_focused = 0;
 static int      g_win_count = 0;
 
+static int event_requires_input(int32_t type) {
+    return type == RS_EV_POINTER_DOWN || type == RS_EV_POINTER_MOVE ||
+           type == RS_EV_POINTER_UP || type == RS_EV_KEY ||
+           type == RS_EV_FOCUS || type == RS_EV_BLUR;
+}
+
 static struct rs_window* win_by_id(uint32_t id) {
     for (int i = 0; i < RS_MAX_WINDOWS; i++)
         if (g_wins[i].used && g_wins[i].id == id) return &g_wins[i];
@@ -187,7 +193,8 @@ static int win_slot(const struct rs_window* w) { return (int)(w - g_wins); }
 
 static void q_push(struct rs_window* win, int32_t type, int32_t x, int32_t y,
                    int32_t meta) {
-    if (!inst_cap(win->inst, RS_CAP_INPUT)) return;
+    if (event_requires_input(type) && !inst_cap(win->inst, RS_CAP_INPUT))
+        return;
     if (win->ev_count >= RS_EVQ) return; /* 队满丢弃(背压由 app 帧循环保证) */
     int tail = (win->ev_head + win->ev_count) % RS_EVQ;
     win->evq[tail].v[0] = type;
@@ -423,6 +430,7 @@ void rs_window_focus(uint32_t id) {
     struct rs_window* win = win_by_id(id);
     if (!win) return;
     if (!(win->flags & RS_FLAG_FOCUSABLE)) return;
+    if (!inst_cap(win->inst, RS_CAP_INPUT)) return;
     uint32_t prev_id = (g_focused == win->id) ? 0 : g_focused;
     for (int i = 0; i < RS_MAX_WINDOWS; i++) g_wins[i].focused = 0;
     win->focused = 1;
@@ -667,10 +675,23 @@ int32_t rs_hit_test(int32_t x, int32_t y) {
 }
 
 void rs_dispatch_event(int32_t type, int32_t x, int32_t y, int32_t meta) {
-    int32_t wid = rs_hit_test(x, y);
-    if (!wid) return;
-    struct rs_window* win = win_by_id((uint32_t)wid);
+    struct rs_window* win = 0;
+    switch (type) {
+        case RS_EV_POINTER_DOWN:
+        case RS_EV_POINTER_MOVE:
+        case RS_EV_POINTER_UP: {
+            int32_t wid = rs_hit_test(x, y);
+            if (wid) win = win_by_id((uint32_t)wid);
+            break;
+        }
+        case RS_EV_KEY:
+            win = g_focused ? win_by_id(g_focused) : 0;
+            break;
+        default:
+            return;
+    }
     if (!win) return;
+    if (!inst_cap(win->inst, RS_CAP_INPUT)) return;
     q_push(win, type, x, y, meta);
 }
 

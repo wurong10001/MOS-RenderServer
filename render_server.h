@@ -179,7 +179,9 @@ uint32_t rs_fb_w(uint32_t fb);
 RS_IMPORT("rs_fb_h")
 uint32_t rs_fb_h(uint32_t fb);
 
-/* 事件队列: 弹出最早事件, 写 4 个 int32(type,x,y,meta) 到 out_ptr; 返回 1/0 */
+/* 事件队列: 弹出最早事件, 写 4 个 int32(type,x,y,meta) 到 out_ptr; 返回 1/0。
+ * POINTER_* / KEY / FOCUS / BLUR 需要 INPUT; KEY 发给焦点窗口。
+ * RESIZE / CLOSE_REQ 是窗口生命周期通知, 不需要 INPUT。 */
 RS_IMPORT("rs_window_poll_event")
 int32_t rs_window_poll_event(uint32_t id, uint32_t out_ptr);
 
@@ -200,6 +202,8 @@ RS_IMPORT("rs_composite")
 void rs_composite(void);
 RS_IMPORT("rs_frame")
 void rs_frame(int32_t frame);
+/* Host 输入入口: POINTER_* 按坐标命中; KEY 发给当前焦点窗口。
+ * 仅接受这四类输入事件, 且目标实例必须有 RS_CAP_INPUT。 */
 RS_IMPORT("rs_dispatch_event")
 void rs_dispatch_event(int32_t type, int32_t x, int32_t y, int32_t meta);
 RS_IMPORT("rs_hit_test")

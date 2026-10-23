@@ -87,8 +87,10 @@ WindowSpec 思路的 WASM 友好落地（v1 API 全部保留，v1 建窗归入�
 - 建窗：`rs_create_window2(inst,title,x,y,w,h,flags,min_w,min_h,max_w,max_h,parent)`
   —— 标量 + flags 位域，不用大结构体 ABI。
   flags：VISIBLE(1) FOCUSABLE(2) RESIZABLE(4) MODAL(8) TRANSPARENT(16)。
-- 能力强制：无 RENDER 不能建窗/绘制/标脏；无 INPUT 收不到事件（server 入口检查，
-  这是 capabilities 的执行点）。
+- 能力强制：无 RENDER 不能建窗/绘制/标脏；无 INPUT 不能获得焦点，也收不到
+  POINTER/KEY/FOCUS/BLUR 输入事件。键盘事件发给当前焦点窗口；指针事件按坐标命中，
+  命中无 INPUT 的窗口时不向下层窗口穿透。RESIZE/CLOSE_REQ 属于窗口生命周期通知，
+  不要求 INPUT。以上检查均在 server 侧执行。
 - 配额：`rs_set_instance_quota_mem` 在建窗分配处强制；`rs_instance_used_mem` 查询。
   quota_fps 未实现（宿主限速语义）。
 - 回调路由：不用函数指针。事件/生命周期进每窗口 8 格环形队列，

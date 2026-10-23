@@ -233,14 +233,37 @@ async function runV2() {
     eq(need(ex, "rs_create_window2")(i2, w.ptr, w.len, 50, 50, 20, 20, 1, 0, 0, 0, 0, 0), 0, "应拒绝");
   });
   t("能力隔离: 无 INPUT 收不到指针事件", () => {
+    const inputName = str("input-under");
+    const inputInst = ex.rs_register_app(inputName.ptr, inputName.len, 1002, CAP_RENDER | CAP_INPUT, 1);
+    const title = str("under");
+    const under = need(ex, "rs_create_window2")(inputInst, title.ptr, title.len, 40, 280, 60, 30, 3, 0, 0, 0, 0, 0);
+    assert(under > 0, "可输入窗口创建失败");
     const n = str("noinput");
-    const i2 = ex.rs_register_app(n.ptr, n.len, 1002, CAP_RENDER, 1);
-    const tt = str("q");
+    const i2 = ex.rs_register_app(n.ptr, n.len, 1007, CAP_RENDER, 1);
+    const tt = str("top");
     const w = need(ex, "rs_create_window2")(i2, tt.ptr, tt.len, 40, 280, 60, 30, 3, 0, 0, 0, 0, 0);
-    assert(w > 0, "建窗失败");
+    assert(w > 0, "无输入权限窗口创建失败");
+    const out = str("").ptr, poll = need(ex, "rs_window_poll_event");
     need(ex, "rs_dispatch_event")(1, 50, 290, 7);
-    const out = str("").ptr;
-    eq(need(ex, "rs_window_poll_event")(w, out), 0, "无 INPUT 不应有事件");
+    eq(poll(w, out), 0, "无 INPUT 的顶层命中窗不应收到指针事件");
+    eq(poll(under, out), 0, "事件不得穿透到下层可输入窗口");
+    need(ex, "rs_window_focus")(w);
+    need(ex, "rs_window_focus")(under);
+    eq(poll(under, out), 1, "可输入窗口应收到 FOCUS");
+    eq(words(ex)[out >> 2], 10, "焦点事件类型");
+    need(ex, "rs_dispatch_event")(4, 65, 0, 9);
+    eq(poll(under, out), 1, "KEY 应路由到当前焦点窗口");
+    eq([words(ex)[out >> 2], words(ex)[(out >> 2) + 1], words(ex)[(out >> 2) + 3]],
+      [4, 65, 9], "键盘事件载荷");
+    eq(poll(w, out), 0, "KEY 不应送达无 INPUT 窗口");
+    need(ex, "rs_window_set_rect")(w, 41, 280, 61, 30);
+    eq(poll(w, out), 1, "RESIZE 生命周期通知无需 INPUT");
+    eq(words(ex)[out >> 2], 12, "resize 事件类型");
+    need(ex, "rs_window_close_request")(w);
+    eq(poll(w, out), 1, "CLOSE_REQ 生命周期通知无需 INPUT");
+    eq(words(ex)[out >> 2], 20, "close 事件类型");
+    need(ex, "rs_dispatch_event")(10, 50, 290, 0);
+    eq(poll(w, out), 0, "宿主不能伪造服务端焦点生命周期事件");
   });
   t("事件队列: INPUT 实例收到 pointer 载荷", () => {
     const n = str("withinput");
