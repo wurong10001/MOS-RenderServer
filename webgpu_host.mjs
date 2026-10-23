@@ -6,15 +6,16 @@
 //     并共享 RenderServer 的线性内存 (--import-memory)
 //   - 帧同步: 每帧驱动各 app 的 frame(), 再调用 server.rs_composite()
 //   - host_submit (server 合成后回调) -> 把脏矩形写入 WebGPU 纹理并呈现
-//   - 事件转发: 指针事件 -> hit-test -> 路由给顶层窗口所属的 app
+//   - 事件转发: 指针事件交给 RenderServer 命中测试并写入目标窗口事件队列
 
 import { packDirtyRect } from './webgpu_upload.mjs';
+import { routePointerEvent } from './event_routing.mjs';
 
 const SERVER_URL = './out/render_server.wasm';
 const APPS = [
-  { name: 'app_a', url: './out/app_a.wasm', init: 'app_a_init', frame: 'app_a_frame', event: 'app_a_event' },
-  { name: 'app_b', url: './out/app_b.wasm', init: 'app_b_init', frame: 'app_b_frame', event: 'app_b_event' },
-  { name: 'app_c', url: './out/app_c.wasm', init: 'app_c_init', frame: 'app_c_frame', event: 'app_c_event' },
+  { name: 'app_a', url: './out/app_a.wasm', init: 'app_a_init', frame: 'app_a_frame' },
+  { name: 'app_b', url: './out/app_b.wasm', init: 'app_b_init', frame: 'app_b_frame' },
+  { name: 'app_c', url: './out/app_c.wasm', init: 'app_c_init', frame: 'app_c_frame' },
 ];
 
 function logFromString(mem, ptr, len) {
@@ -166,11 +167,7 @@ async function main() {
   status.textContent = 'running: ' + appInstances.length + ' apps composited by RenderServer';
 
   function routeEvent(type, x, y) {
-    const wid = server.exports.rs_hit_test(x, y);
-    if (type === 1) server.exports.rs_window_focus(wid);
-    for (const ai of appInstances) {
-      if (ai.win === wid) { ai.instance.exports[ai.event](wid, type, x, y, 0); return; }
-    }
+    routePointerEvent(server.exports, type, x, y, 0);
   }
   function localXY(e) {
     const r = canvas.getBoundingClientRect();

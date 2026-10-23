@@ -8,6 +8,7 @@
 //            focus-blur / fb 句柄 / 配额 / 关闭拦截 / icon / 标题 / 配置
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { routePointerEvent } from "./event_routing.mjs";
 import { packDirtyRect } from "./webgpu_upload.mjs";
 
 const OUT = process.argv[2] || join(process.cwd(), "out");
@@ -79,6 +80,23 @@ t("脏区上传: 按屏幕行跨度提取紧密矩形", () => {
     rejected = error instanceof RangeError;
   }
   assert(rejected, "越界脏矩形应拒绝上传");
+});
+t("宿主指针路由: 通过 RenderServer 分发并在按下时聚焦", () => {
+  const calls = [];
+  const server = {
+    rs_hit_test: (x, y) => { calls.push(["hit", x, y]); return 42; },
+    rs_window_focus: (id) => calls.push(["focus", id]),
+    rs_dispatch_event: (type, x, y, meta) => calls.push(["dispatch", type, x, y, meta]),
+  };
+  routePointerEvent(server, 1, 30, 40, 0);
+  eq(calls, [
+    ["hit", 30, 40],
+    ["focus", 42],
+    ["dispatch", 1, 30, 40, 0],
+  ], "pointerdown 应聚焦命中窗口并交给事件队列");
+  calls.length = 0;
+  routePointerEvent(server, 2, 31, 41, 0);
+  eq(calls, [["dispatch", 2, 31, 41, 0]], "pointermove 应直接交给 RenderServer");
 });
 
 // ---------- BASE: v1 行为 ----------

@@ -56,7 +56,7 @@ wasm3）可基于同一 out/render_server_demo.wasm 复用。
   2. 依次实例化 app_a/b/c.wasm，用 server 导出的 rs_* 作为 render_server 模块导入，并共享 server 的内存（--import-memory）
   3. 每帧驱动各 app 的 frame()，再调用 server.rs_composite()
   4. server 合成后回调 host_submit(屏幕偏移, w, h, 脏矩形) —— 宿主把脏矩形写入 WebGPU 纹理并提交呈现
-  5. 指针事件经 hit-test 路由给顶层窗口所属的 app
+  5. 指针事件经 `rs_dispatch_event` 入目标窗口队列；app 在帧循环中通过 `rs_window_poll_event` 读取
 
 ## 应用侧 C ABI（app 调用）
 
